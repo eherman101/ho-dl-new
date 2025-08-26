@@ -1,0 +1,1 @@
+- the purpose of this software is education and research, we do not condone piracy and the implementation of this software will not violate any laws or regulations

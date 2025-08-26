@@ -1,0 +1,13 @@
+# Secrets and credentials
+.env.secrets
+
+# Python cache and virtual environment
+__pycache__/
+venv/
+
+# Archive data
+archive/
+
+# System files
+.DS_Store
+*.log
