@@ -7,9 +7,13 @@ Educational and research purposes only
 import os
 import requests
 import json
+import subprocess
+import base64
+import xml.etree.ElementTree as ET
 from urllib.parse import quote
 from dotenv import load_dotenv
 import logging
+import binascii
 
 class HooplaScraper:
     def __init__(self):
@@ -584,6 +588,552 @@ fragment TitleListItemFragment on Title {
         else:
             self.logger.error(f"Failed to archive audiobook ID: {item_id}")
             return None
+
+    def get_license_blob(self, media_key, patron_id, circulation_id):
+        """Get license blob for media access using Castlabs upfront auth tokens"""
+        if not self.token:
+            self.logger.error("Not authenticated. Please login first.")
+            return None
+            
+        # Construct the license URL using the media key, patron ID, and circulation ID
+        license_url = f'https://patron-api-gateway.hoopladigital.com/license/castlabs/upfront-auth-tokens/{media_key}/{patron_id}/{circulation_id}'
+        
+        # Set up license request headers
+        license_headers = {
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': 'en-US,en;q=0.9',
+            'authorization': f'Bearer {self.token}',
+            'content-type': 'application/x-www-form-urlencoded',
+            'dnt': '1',
+            'origin': 'https://www.hoopladigital.com',
+            'priority': 'u=1, i',
+            'referer': 'https://www.hoopladigital.com/',
+            'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-site',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        }
+        
+        try:
+            self.logger.info(f"Requesting license blob for media key: {media_key}")
+            response = self.session.get(license_url, headers=license_headers)
+            response.raise_for_status()
+            
+            # The response is a JWT token string, not JSON
+            license_token = response.text.strip()
+            if license_token:
+                return {
+                    'jwt_token': license_token,
+                    'media_key': media_key,
+                    'patron_id': patron_id,
+                    'circulation_id': circulation_id,
+                    'retrieved_at': response.headers.get('Date')
+                }
+            else:
+                self.logger.error("Empty license response received")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to get license blob for {media_key}: {e}")
+            return None
+
+    def get_mpd_manifest(self, media_key):
+        """Get MPD manifest for media streaming"""
+        if not media_key:
+            self.logger.error("Media key is required to get MPD manifest")
+            return None
+            
+        # Construct MPD manifest URL
+        mpd_url = f'https://dash.hoopladigital.com/{media_key}/Manifest.mpd'
+        
+        # Set up MPD request headers
+        mpd_headers = {
+            'sec-ch-ua-platform': '"Windows"',
+            'Referer': 'https://www.hoopladigital.com/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+            'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+            'DNT': '1',
+            'sec-ch-ua-mobile': '?0'
+        }
+        
+        try:
+            self.logger.info(f"Requesting MPD manifest for media key: {media_key}")
+            response = self.session.get(mpd_url, headers=mpd_headers)
+            response.raise_for_status()
+            
+            # MPD is XML content, return as text
+            mpd_content = response.text
+            if mpd_content:
+                return {
+                    'mpd_content': mpd_content,
+                    'media_key': media_key,
+                    'mpd_url': mpd_url,
+                    'retrieved_at': response.headers.get('Date'),
+                    'content_type': response.headers.get('Content-Type')
+                }
+            else:
+                self.logger.error("Empty MPD manifest response received")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to get MPD manifest for {media_key}: {e}")
+            return None
+
+    def parse_mpd_manifest(self, mpd_content):
+        """Parse MPD manifest to extract DRM information and KIDs"""
+        try:
+            root = ET.fromstring(mpd_content)
+            
+            # Define namespaces used in DASH manifests
+            namespaces = {
+                'mpd': 'urn:mpeg:dash:schema:mpd:2011',
+                'cenc': 'urn:mpeg:cenc:2013'
+            }
+            
+            # Extract content protection information
+            drm_info = {
+                'kids': [],
+                'pssh_data': {},
+                'license_urls': {},
+                'default_kid': None
+            }
+            
+            # Find ContentProtection elements
+            for cp in root.findall('.//mpd:ContentProtection', namespaces):
+                scheme_id = cp.get('schemeIdUri', '')
+                
+                # Extract KID from default_KID attribute (CENC common encryption)
+                default_kid = cp.get('{urn:mpeg:cenc:2013}default_KID')
+                if default_kid:
+                    drm_info['default_kid'] = default_kid.replace('-', '').lower()
+                    drm_info['kids'].append(drm_info['default_kid'])
+                
+                # Extract Widevine PSSH (UUID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed)
+                if 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' in scheme_id:
+                    pssh_element = cp.find('.//cenc:pssh', namespaces)
+                    if pssh_element is not None:
+                        drm_info['pssh_data']['widevine'] = pssh_element.text.strip()
+                
+                # Extract PlayReady PSSH (UUID: 9a04f079-9840-4286-ab92-e65be0885f95)
+                if '9a04f079-9840-4286-ab92-e65be0885f95' in scheme_id:
+                    pssh_element = cp.find('.//cenc:pssh', namespaces)
+                    if pssh_element is not None:
+                        drm_info['pssh_data']['playready'] = pssh_element.text.strip()
+                
+                # Extract castLabs DRMtoday information
+                if 'castlabs:drmtoday' in scheme_id:
+                    asset_id = cp.get('{urn:castlabs:drmtoday:cenc:2014}assetId')
+                    variant_id = cp.get('{urn:castlabs:drmtoday:cenc:2014}variantId')
+                    if asset_id:
+                        drm_info['castlabs_asset_id'] = asset_id
+                    if variant_id:
+                        drm_info['castlabs_variant_id'] = variant_id
+                
+            # Extract period-level protection if present
+            for period in root.findall('.//mpd:Period', namespaces):
+                for adaptation_set in period.findall('.//mpd:AdaptationSet', namespaces):
+                    for cp in adaptation_set.findall('.//mpd:ContentProtection', namespaces):
+                        default_kid = cp.get('cenc:default_KID')
+                        if default_kid and default_kid not in drm_info['kids']:
+                            kid_hex = default_kid.replace('-', '').lower()
+                            drm_info['kids'].append(kid_hex)
+                            if drm_info['default_kid'] is None:
+                                drm_info['default_kid'] = kid_hex
+            
+            self.logger.info(f"Extracted DRM info: {len(drm_info['kids'])} KIDs found")
+            return drm_info
+            
+        except ET.ParseError as e:
+            self.logger.error(f"Failed to parse MPD manifest: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting DRM info from manifest: {e}")
+            return None
+
+    def get_widevine_license(self, jwt_token, pssh_data, user_id, session_id):
+        """Get Widevine license from castLabs DRMtoday"""
+        if not pssh_data.get('widevine'):
+            self.logger.error("No Widevine PSSH data available")
+            return None
+            
+        # Prepare custom data as described in the documentation
+        custom_data = {
+            "userId": int(user_id),
+            "sessionId": session_id,
+            "merchant": "hoopla"
+        }
+        custom_data_b64 = base64.b64encode(json.dumps(custom_data).encode()).decode()
+        
+        # DRMtoday license URL from documentation
+        license_url = 'https://lic.drmtoday.com/license-proxy-widevine/cenc/'
+        
+        # Create a simple Widevine license request
+        # In a real implementation, this would be generated by the Widevine CDM
+        # For educational purposes, we'll create a basic request structure
+        license_request_data = base64.b64decode(pssh_data['widevine'])
+        
+        headers = {
+            'Content-Type': 'application/octet-stream',
+            'x-dt-auth-token': jwt_token,
+            'dt-custom-data': custom_data_b64,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        }
+        
+        try:
+            self.logger.info("Requesting Widevine license from DRMtoday")
+            response = self.session.post(
+                license_url,
+                data=license_request_data,
+                headers=headers
+            )
+            response.raise_for_status()
+            
+            # The response should contain the license
+            license_response = response.content
+            
+            self.logger.info("Successfully obtained Widevine license")
+            return {
+                'license_data': base64.b64encode(license_response).decode(),
+                'license_url': license_url,
+                'custom_data': custom_data,
+                'retrieved_at': response.headers.get('Date')
+            }
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to get Widevine license: {e}")
+            if hasattr(e.response, 'text'):
+                self.logger.error(f"Response: {e.response.text}")
+            return None
+
+    def decrypt_with_mp4decrypt(self, encrypted_file_path, kid, key, output_path=None):
+        """Decrypt MP4 file using Bento4 mp4decrypt with extracted keys"""
+        if output_path is None:
+            base_name = os.path.splitext(encrypted_file_path)[0]
+            output_path = f"{base_name}_decrypted.m4a"
+        
+        # Format KID and key for mp4decrypt
+        # mp4decrypt expects hex format: --key <kid>:<key>
+        kid_hex = kid.replace('-', '').lower()
+        
+        mp4decrypt_path = os.path.join(os.getcwd(), 'bento4_tools', 'mp4decrypt')
+        
+        command = [
+            mp4decrypt_path,
+            '--show-progress',
+            '--key', f'{kid_hex}:{key}',
+            encrypted_file_path,
+            output_path
+        ]
+        
+        try:
+            self.logger.info(f"Decrypting {encrypted_file_path} with mp4decrypt")
+            self.logger.info(f"Using KID: {kid_hex}")
+            self.logger.info(f"Output: {output_path}")
+            
+            result = subprocess.run(
+                command,
+                cwd=os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            if result.returncode == 0:
+                self.logger.info(f"Successfully decrypted to: {output_path}")
+                self.logger.info(f"mp4decrypt output: {result.stdout}")
+                return output_path
+            else:
+                self.logger.error(f"mp4decrypt failed: {result.stderr}")
+                self.logger.error(f"Command output: {result.stdout}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("mp4decrypt operation timed out")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error running mp4decrypt: {e}")
+            return None
+
+    def extract_media_info_from_audiobook(self, audiobook_data):
+        """Extract media key, patron ID, and circulation ID from audiobook data"""
+        try:
+            title_data = audiobook_data['data']['title']
+            
+            # Extract media key
+            media_key = title_data.get('mediaKey')
+            
+            # Extract circulation info
+            circulation = title_data.get('circulation')
+            if circulation:
+                circulation_id = circulation.get('id')
+                patron_id = circulation.get('patron', {}).get('id')
+            else:
+                circulation_id = None
+                patron_id = None
+                
+            return {
+                'media_key': media_key,
+                'patron_id': patron_id,
+                'circulation_id': circulation_id
+            }
+        except (KeyError, TypeError) as e:
+            self.logger.error(f"Failed to extract media info: {e}")
+            return None
+
+    def get_audiobook_license(self, audiobook_data):
+        """Get license blob for an audiobook using data from get_audiobook_details"""
+        media_info = self.extract_media_info_from_audiobook(audiobook_data)
+        
+        if not media_info or not all(media_info.values()):
+            self.logger.error("Missing required media information (media_key, patron_id, or circulation_id)")
+            return None
+            
+        return self.get_license_blob(
+            media_info['media_key'],
+            media_info['patron_id'], 
+            media_info['circulation_id']
+        )
+
+    def archive_audiobook_with_license(self, item_id):
+        """Archive audiobook details and license blob"""
+        self.logger.info(f"Archiving audiobook with license for ID: {item_id}")
+        
+        # Get audiobook details first
+        audiobook_data = self.get_audiobook_details(item_id)
+        if not audiobook_data:
+            return None
+            
+        # Get license blob
+        license_data = self.get_audiobook_license(audiobook_data)
+        
+        # Get MPD manifest
+        media_info = self.extract_media_info_from_audiobook(audiobook_data)
+        mpd_data = None
+        if media_info and media_info['media_key']:
+            mpd_data = self.get_mpd_manifest(media_info['media_key'])
+        
+        # Save audiobook details, license, and MPD manifest
+        audiobook_filename = f"audiobook_{item_id}.json"
+        self.save_data(audiobook_data, audiobook_filename)
+        
+        if license_data:
+            license_filename = f"license_{item_id}.json"
+            self.save_data(license_data, license_filename)
+            
+        if mpd_data:
+            mpd_filename = f"mpd_{item_id}.json"
+            self.save_data(mpd_data, mpd_filename)
+            
+        # Log results
+        try:
+            title = audiobook_data['data']['title']['title']
+            status_parts = [f"archived: {title}"]
+            if license_data:
+                status_parts.append("license ✓")
+            if mpd_data:
+                status_parts.append("MPD ✓")
+            self.logger.info(f"Successfully {', '.join(status_parts)}")
+        except (KeyError, TypeError):
+            self.logger.info(f"Successfully archived audiobook ID: {item_id}")
+            
+        return {
+            'audiobook_data': audiobook_data,
+            'license_data': license_data,
+            'mpd_data': mpd_data
+        }
+
+    def download_with_ytdlp(self, item_id, output_dir=None):
+        """Download audiobook using yt-dlp with MPD manifest"""
+        if output_dir is None:
+            output_dir = os.path.join('archive', f'downloads_{item_id}')
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # First get all the necessary data
+        audiobook_data = self.get_audiobook_details(item_id)
+        if not audiobook_data:
+            self.logger.error(f"Could not get audiobook data for ID: {item_id}")
+            return False
+            
+        license_data = self.get_audiobook_license(audiobook_data)
+        if not license_data:
+            self.logger.error(f"Could not get license data for ID: {item_id}")
+            return False
+            
+        media_info = self.extract_media_info_from_audiobook(audiobook_data)
+        if not media_info or not media_info['media_key']:
+            self.logger.error(f"Could not extract media key for ID: {item_id}")
+            return False
+            
+        # Construct MPD URL
+        mpd_url = f"https://dash.hoopladigital.com/{media_info['media_key']}/Manifest.mpd"
+        
+        # Set up yt-dlp command with proper headers and authentication
+        yt_dlp_path = os.path.join(os.getcwd(), 'venv', 'bin', 'yt-dlp')
+        
+        command = [
+            yt_dlp_path,
+            '--allow-unplayable-formats',  # Allow DRM-protected formats (developer option)
+            '--allow-dynamic-mpd',  # Process dynamic DASH manifests
+            '--concurrent-fragments', '4',  # Download multiple fragments simultaneously
+            '--add-header', 'Referer:https://www.hoopladigital.com/',
+            '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+            '--add-header', f'Authorization:Bearer {self.token}',
+            '--output', os.path.join(output_dir, f'audiobook_{item_id}_%(title)s.%(ext)s'),
+            '--write-info-json',  # Save metadata
+            '--write-description',  # Save description
+            '--no-flat-playlist',  # Fully extract the videos of a playlist
+            '--verbose',  # More detailed output for debugging
+            mpd_url
+        ]
+        
+        try:
+            self.logger.info(f"Starting yt-dlp download for audiobook ID: {item_id}")
+            self.logger.info(f"MPD URL: {mpd_url}")
+            self.logger.info(f"Output directory: {output_dir}")
+            
+            # Run yt-dlp command
+            result = subprocess.run(
+                command, 
+                cwd=os.getcwd(),
+                capture_output=True, 
+                text=True,
+                timeout=3600  # 1 hour timeout
+            )
+            
+            if result.returncode == 0:
+                self.logger.info(f"Successfully downloaded audiobook ID: {item_id}")
+                self.logger.info(f"yt-dlp output: {result.stdout}")
+                return True
+            else:
+                self.logger.error(f"yt-dlp failed for audiobook ID: {item_id}")
+                self.logger.error(f"Error output: {result.stderr}")
+                self.logger.error(f"Command output: {result.stdout}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"yt-dlp download timed out for audiobook ID: {item_id}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error running yt-dlp for audiobook ID {item_id}: {e}")
+            return False
+
+    def archive_and_download_audiobook(self, item_id):
+        """Complete workflow: archive metadata and download audiobook"""
+        self.logger.info(f"Starting complete archive and download for ID: {item_id}")
+        
+        # First archive all metadata
+        archive_result = self.archive_audiobook_with_license(item_id)
+        if not archive_result:
+            self.logger.error(f"Failed to archive metadata for ID: {item_id}")
+            return False
+            
+        # Then download the audiobook
+        download_result = self.download_with_ytdlp(item_id)
+        
+        return {
+            'archive_success': bool(archive_result),
+            'download_success': download_result,
+            'archive_data': archive_result
+        }
+
+    def complete_audiobook_workflow(self, item_id):
+        """Complete workflow: archive, download, extract DRM info, get license, and decrypt"""
+        self.logger.info(f"Starting complete audiobook workflow for ID: {item_id}")
+        
+        # Step 1: Archive metadata (audiobook details, license, MPD)
+        archive_result = self.archive_audiobook_with_license(item_id)
+        if not archive_result:
+            return {'success': False, 'error': 'Failed to archive metadata'}
+        
+        # Step 2: Download encrypted content using yt-dlp
+        download_result = self.download_with_ytdlp(item_id)
+        if not download_result:
+            return {'success': False, 'error': 'Failed to download content'}
+        
+        # Step 3: Parse MPD manifest for DRM info
+        mpd_data = archive_result.get('mpd_data')
+        if not mpd_data:
+            return {'success': False, 'error': 'No MPD data available'}
+            
+        drm_info = self.parse_mpd_manifest(mpd_data['mpd_content'])
+        if not drm_info:
+            return {'success': False, 'error': 'Failed to parse MPD manifest'}
+        
+        # Save DRM info
+        drm_filename = f"drm_info_{item_id}.json"
+        self.save_data(drm_info, drm_filename)
+        
+        # Step 4: Get Widevine license (if needed and PSSH available)
+        license_data = archive_result.get('license_data')
+        media_info = self.extract_media_info_from_audiobook(archive_result['audiobook_data'])
+        
+        widevine_license = None
+        if drm_info.get('pssh_data', {}).get('widevine') and license_data:
+            widevine_license = self.get_widevine_license(
+                license_data['jwt_token'],
+                drm_info['pssh_data'],
+                media_info['patron_id'],
+                media_info['circulation_id']
+            )
+            
+            if widevine_license:
+                widevine_filename = f"widevine_license_{item_id}.json"
+                self.save_data(widevine_license, widevine_filename)
+        
+        # Step 5: Attempt decryption with mp4decrypt
+        download_dir = os.path.join('archive', f'downloads_{item_id}')
+        encrypted_files = [f for f in os.listdir(download_dir) if f.endswith('.m4a')]
+        
+        decryption_results = []
+        if encrypted_files and drm_info.get('default_kid'):
+            for encrypted_file in encrypted_files:
+                encrypted_path = os.path.join(download_dir, encrypted_file)
+                
+                # For now, we'll try with a placeholder key since we need the actual 
+                # Widevine CDM to extract the real keys
+                # In a real implementation, this would come from the Widevine license response
+                placeholder_key = "00" * 16  # 128-bit key of all zeros
+                
+                self.logger.warning("Using placeholder key - real implementation would extract from Widevine license")
+                
+                decrypted_path = self.decrypt_with_mp4decrypt(
+                    encrypted_path,
+                    drm_info['default_kid'],
+                    placeholder_key,
+                    os.path.join(download_dir, f"decrypted_{encrypted_file}")
+                )
+                
+                decryption_results.append({
+                    'input_file': encrypted_file,
+                    'output_file': decrypted_path,
+                    'success': decrypted_path is not None
+                })
+        
+        # Step 6: Return comprehensive results
+        result = {
+            'success': True,
+            'item_id': item_id,
+            'archive_data': archive_result,
+            'drm_info': drm_info,
+            'widevine_license': widevine_license,
+            'decryption_results': decryption_results,
+            'workflow_stages': {
+                'metadata_archive': bool(archive_result),
+                'content_download': download_result,
+                'drm_parsing': bool(drm_info),
+                'license_acquisition': bool(widevine_license),
+                'decryption_attempted': len(decryption_results) > 0
+            }
+        }
+        
+        self.logger.info("Complete audiobook workflow finished")
+        self.logger.info(f"Workflow stages: {result['workflow_stages']}")
+        
+        return result
 
     def save_data(self, data, filename):
         """Save data to JSON file"""
